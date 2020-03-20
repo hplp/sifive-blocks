@@ -5,9 +5,8 @@ import Chisel._
 import freechips.rocketchip.config.{Field, Parameters}
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.tilelink._
-import freechips.rocketchip.util.AsyncQueueParams
 
-case class ChipLinkParams(TLUH: Seq[AddressSet], TLC: Seq[AddressSet], sourceBits: Int = 6, sinkBits: Int = 5, syncTX: Boolean = false, fpgaReset: Boolean = false)
+case class ChipLinkParams(TLUH: Seq[AddressSet], TLC: Seq[AddressSet], sourceBits: Int = 6, sinkBits: Int = 5, syncTX: Boolean = false)
 {
   val domains = 8 // hard-wired into chiplink protocol
   require (sourceBits >= log2Ceil(domains))
@@ -20,7 +19,7 @@ case class ChipLinkParams(TLUH: Seq[AddressSet], TLC: Seq[AddressSet], sourceBit
   val dataBits = dataBytes*8
   val clSourceBits = 16
   val clSinkBits = 16
-  val crossing = AsyncQueueParams()
+  val crossingDepth = 8
   val Qdepth = 8192 / dataBytes
   val maxXfer = 4096
   val xferBits = log2Ceil(maxXfer)
@@ -39,7 +38,7 @@ case class ChipLinkParams(TLUH: Seq[AddressSet], TLC: Seq[AddressSet], sourceBit
 case object ChipLinkKey extends Field[Seq[ChipLinkParams]]
 
 case class TXN(domain: Int, source: Int)
-case class ChipLinkInfo(params: ChipLinkParams, edgeIn: TLEdge, edgeOut: TLEdge, errorDev: AddressSet)
+case class ChipLinkInfo(params: ChipLinkParams, edgeIn: TLEdge, edgeOut: TLEdge, errorDev: BigInt)
 {
   // TL source => CL TXN
   val sourceMap: Map[Int, TXN] = {
@@ -131,10 +130,8 @@ case class ChipLinkInfo(params: ChipLinkParams, edgeIn: TLEdge, edgeOut: TLEdge,
   }
 
   // You can't just unilaterally use error, because this would misalign the mask
-  def makeError(legal: Bool, address: UInt): UInt = {
-    val alignBits = log2Ceil(errorDev.alignment)
+  def makeError(legal: Bool, address: UInt): UInt =
     Cat(
-      Mux(legal, address, UInt(errorDev.base))(params.addressBits-1, alignBits),
-      address(alignBits-1, 0))
-  }
+      Mux(legal, address, UInt(errorDev))(params.addressBits-1, log2Ceil(params.maxXfer)),
+      address(log2Ceil(params.maxXfer)-1, 0))
 }

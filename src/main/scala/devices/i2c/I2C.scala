@@ -42,17 +42,16 @@
 package sifive.blocks.devices.i2c
 
 import Chisel._
-import freechips.rocketchip.config.Parameters
-import freechips.rocketchip.diplomacy._
-import freechips.rocketchip.interrupts._
+import chisel3.experimental.MultiIOModule
+import freechips.rocketchip.config._
 import freechips.rocketchip.regmapper._
 import freechips.rocketchip.tilelink._
+import freechips.rocketchip.subsystem._
 import freechips.rocketchip.util.{AsyncResetRegVec, Majority}
 
 case class I2CParams(
   address: BigInt,
-  controlXType: ClockCrossingType = NoCrossing,
-  intXType: ClockCrossingType = NoCrossing)
+  crossingType: SubsystemClockCrossing = SynchronousCrossing())
 
 class I2CPin extends Bundle {
   val in  = Bool(INPUT)
@@ -65,19 +64,13 @@ class I2CPort extends Bundle {
   val sda = new I2CPin
 }
 
-abstract class I2C(busWidthBytes: Int, params: I2CParams)(implicit p: Parameters)
-    extends IORegisterRouter(
-      RegisterRouterParams(
-        name = "i2c",
-        compat = Seq("sifive,i2c0"),
-        base = params.address,
-        beatBytes = busWidthBytes),
-      new I2CPort)
-    with HasInterruptSources {
+trait HasI2CBundleContents extends Bundle {
+  val port = new I2CPort
+}
 
-  def nInterrupts = 1
-
-  lazy val module = new LazyModuleImp(this) {
+trait HasI2CModuleContents extends MultiIOModule with HasRegMap {
+  val io: HasI2CBundleContents
+  val params: I2CParams
 
   val I2C_CMD_NOP   = UInt(0x00)
   val I2C_CMD_START = UInt(0x01)
@@ -126,8 +119,8 @@ abstract class I2C(busWidthBytes: Int, params: I2CParams)(implicit p: Parameters
 
   //////// Bit level ////////
 
-  port.scl.out := false.B                           // i2c clock line output
-  port.sda.out := false.B                           // i2c data line output
+  io.port.scl.out := false.B                           // i2c clock line output
+  io.port.sda.out := false.B                           // i2c data line output
 
   // filter SCL and SDA signals; (attempt to) remove glitches
   val filterCnt = Reg(init = UInt(0, 14.W))
@@ -142,8 +135,8 @@ abstract class I2C(busWidthBytes: Int, params: I2CParams)(implicit p: Parameters
   val fSCL      = Reg(init = UInt(0x7, 3.W))
   val fSDA      = Reg(init = UInt(0x7, 3.W))
   when (!(filterCnt.orR)) {
-    fSCL := Cat(fSCL, port.scl.in)
-    fSDA := Cat(fSDA, port.sda.in)
+    fSCL := Cat(fSCL, io.port.scl.in)
+    fSDA := Cat(fSDA, io.port.sda.in)
   }
 
   val sSCL      = Reg(init = true.B, next = Majority(fSCL))
@@ -152,7 +145,7 @@ abstract class I2C(busWidthBytes: Int, params: I2CParams)(implicit p: Parameters
   val dSCL      = Reg(init = true.B, next = sSCL)
   val dSDA      = Reg(init = true.B, next = sSDA)
 
-  val dSCLOen   = Reg(next = port.scl.oe) // delayed scl_oen
+  val dSCLOen   = Reg(next = io.port.scl.oe) // delayed scl_oen
 
   // detect start condition => detect falling edge on SDA while SCL is high
   // detect stop  condition => detect rising  edge on SDA while SCL is high
@@ -161,12 +154,12 @@ abstract class I2C(busWidthBytes: Int, params: I2CParams)(implicit p: Parameters
 
   // master drives SCL high, but another master pulls it low
   // master start counting down its low cycle now (clock synchronization)
-  val sclSync   = dSCL && !sSCL && port.scl.oe
+  val sclSync   = dSCL && !sSCL && io.port.scl.oe
 
   // slave_wait is asserted when master wants to drive SCL high, but the slave pulls it low
   // slave_wait remains asserted until the slave releases SCL
   val slaveWait = Reg(init = false.B)
-  slaveWait := (port.scl.oe && !dSCLOen && !sSCL) || (slaveWait && !sSCL)
+  slaveWait := (io.port.scl.oe && !dSCLOen && !sSCL) || (slaveWait && !sSCL)
 
   val clkEn     = Reg(init = true.B)     // clock generation signals
   val cnt       = Reg(init = UInt(0, 16.W))  // clock divider counter (synthesis)
@@ -185,10 +178,10 @@ abstract class I2C(busWidthBytes: Int, params: I2CParams)(implicit p: Parameters
   }
 
   val sclOen     = Reg(init = true.B)
-  port.scl.oe := !sclOen
+  io.port.scl.oe := !sclOen
 
   val sdaOen     = Reg(init = true.B)
-  port.sda.oe := !sdaOen
+  io.port.sda.oe := !sdaOen
 
   val sdaChk     = Reg(init = false.B)       // check SDA output (Multi-master arbitration)
 
@@ -570,44 +563,13 @@ abstract class I2C(busWidthBytes: Int, params: I2CParams)(implicit p: Parameters
   status.reserved  := 0.U
 
   interrupts(0) := status.irqFlag & control.intEn
-}}
+}
 
-class TLI2C(busWidthBytes: Int, params: I2CParams)(implicit p: Parameters)
-  extends I2C(busWidthBytes, params) with HasTLControlRegMap
-
-case class I2CAttachParams(
-  i2c: I2CParams,
-  controlBus: TLBusWrapper,
-  intNode: IntInwardNode,
-  controlXType: ClockCrossingType = NoCrossing,
-  intXType: ClockCrossingType = NoCrossing,
-  mclock: Option[ModuleValue[Clock]] = None,
-  mreset: Option[ModuleValue[Bool]] = None)
-  (implicit val p: Parameters)
-
-object I2C {
-  val nextId = { var i = -1; () => { i += 1; i} }
-
-  def attach(params: I2CAttachParams): TLI2C = {
-    implicit val p = params.p
-    val name = s"i2c_${nextId()}"
-    val cbus = params.controlBus
-    val i2c = LazyModule(new TLI2C(cbus.beatBytes, params.i2c))
-    i2c.suggestName(name)
-
-    cbus.coupleTo(s"device_named_$name") {
-      i2c.controlXing(params.controlXType) := TLFragmenter(cbus.beatBytes, cbus.blockBytes) := _
-    }
-    params.intNode := i2c.intXing(params.intXType)
-    InModuleBody { i2c.module.clock := params.mclock.map(_.getWrappedValue).getOrElse(cbus.module.clock) }
-    InModuleBody { i2c.module.reset := params.mreset.map(_.getWrappedValue).getOrElse(cbus.module.reset) }
-
-    i2c
-  }
-
-  def attachAndMakePort(params: I2CAttachParams): ModuleValue[I2CPort] = {
-    val i2c = attach(params)
-    val i2cNode = i2c.ioNode.makeSink()(params.p)
-    InModuleBody { i2cNode.makeIO()(ValName(i2c.name)) }
-  }
+// Magic TL2 Incantation to create a TL2 Slave
+class TLI2C(w: Int, c: I2CParams)(implicit p: Parameters)
+  extends TLRegisterRouter(c.address, "i2c", Seq("sifive,i2c0"), interrupts = 1, beatBytes = w)(
+  new TLRegBundle(c, _)    with HasI2CBundleContents)(
+  new TLRegModule(c, _, _) with HasI2CModuleContents)
+  with HasCrossing {
+  val crossing = c.crossingType
 }

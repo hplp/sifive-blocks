@@ -2,18 +2,18 @@
 package sifive.blocks.devices.pwm
 
 import Chisel._
-import Chisel.ImplicitConversions._
 import chisel3.experimental.MultiIOModule
+import Chisel.ImplicitConversions._
 import freechips.rocketchip.config.Parameters
-import freechips.rocketchip.diplomacy._
-import freechips.rocketchip.interrupts._
 import freechips.rocketchip.regmapper._
 import freechips.rocketchip.tilelink._
+import freechips.rocketchip.subsystem._
 import freechips.rocketchip.util._
 import sifive.blocks.util.{GenericTimer, GenericTimerIO, DefaultGenericTimerCfgDescs}
 
 // Core PWM Functionality  & Register Interface
-class PWMTimer(val ncmp: Int = 4, val cmpWidth: Int = 16) extends MultiIOModule with GenericTimer {
+
+class PWM(val ncmp: Int = 4, val cmpWidth: Int = 16) extends MultiIOModule with GenericTimer {
 
   def orR(v: Vec[Bool]): Bool = v.foldLeft(Bool(false))( _||_ )
 
@@ -61,68 +61,30 @@ case class PWMParams(
   size: Int = 0x1000,
   regBytes: Int = 4,
   ncmp: Int = 4,
-  cmpWidth: Int = 16)
+  cmpWidth: Int = 16,
+  crossingType: SubsystemClockCrossing = SynchronousCrossing())
 
-class PWMPortIO(val c: PWMParams) extends Bundle {
-  val gpio = Vec(c.ncmp, Bool()).asOutput
+trait HasPWMBundleContents extends Bundle {
+  def params: PWMParams
+  val gpio = Vec(params.ncmp, Bool()).asOutput
 }
 
-abstract class PWM(busWidthBytes: Int, val params: PWMParams)(implicit p: Parameters)
-    extends IORegisterRouter(
-      RegisterRouterParams(
-        name = "pwm",
-        compat = Seq("sifive,pwm0"),
-        base = params.address,
-        size = params.size,
-        beatBytes = busWidthBytes),
-      new PWMPortIO(params))
-    with HasInterruptSources {
+trait HasPWMModuleContents extends MultiIOModule with HasRegMap {
+  val io: HasPWMBundleContents
+  val params: PWMParams
 
-  def nInterrupts = params.ncmp
+  val pwm = Module(new PWM(params.ncmp, params.cmpWidth))
 
-  lazy val module = new LazyModuleImp(this) {
-    val pwm = Module(new PWMTimer(params.ncmp, params.cmpWidth))
-    interrupts := pwm.io.ip
-    port.gpio := pwm.io.gpio
-    regmap((GenericTimer.timerRegMap(pwm, 0, params.regBytes)):_*)
-  }
+  interrupts := pwm.io.ip
+  io.gpio := pwm.io.gpio
+
+  regmap((GenericTimer.timerRegMap(pwm, 0, params.regBytes)):_*)
 }
 
-class TLPWM(busWidthBytes: Int, params: PWMParams)(implicit p: Parameters)
-  extends PWM(busWidthBytes, params) with HasTLControlRegMap
-
-case class PWMAttachParams(
-  pwm: PWMParams,
-  controlBus: TLBusWrapper,
-  intNode: IntInwardNode,
-  mclock: Option[ModuleValue[Clock]] = None,
-  mreset: Option[ModuleValue[Bool]] = None,
-  controlXType: ClockCrossingType = NoCrossing,
-  intXType: ClockCrossingType = NoCrossing)
-  (implicit val p: Parameters)
-
-object PWM {
-  val nextId = { var i = -1; () => { i += 1; i} }
-
-  def attach(params: PWMAttachParams): TLPWM = {
-    implicit val p = params.p
-    val name = s"pwm_${nextId()}"
-    val cbus = params.controlBus
-    val pwm = LazyModule(new TLPWM(cbus.beatBytes, params.pwm))
-    pwm.suggestName(name)
-    cbus.coupleTo(s"device_named_$name") {
-      pwm.controlXing(params.controlXType) := TLFragmenter(cbus.beatBytes, cbus.blockBytes) := _
-    }
-    params.intNode := pwm.intXing(params.intXType)
-    InModuleBody { pwm.module.clock := params.mclock.map(_.getWrappedValue).getOrElse(cbus.module.clock) }
-    InModuleBody { pwm.module.reset := params.mreset.map(_.getWrappedValue).getOrElse(cbus.module.reset) }
-
-    pwm
-  }
-
-  def attachAndMakePort(params: PWMAttachParams): ModuleValue[PWMPortIO] = {
-    val pwm = attach(params)
-    val pwmNode = pwm.ioNode.makeSink()(params.p)
-    InModuleBody { pwmNode.makeIO()(ValName(pwm.name)) }
-  }
+class TLPWM(w: Int, c: PWMParams)(implicit p: Parameters)
+  extends TLRegisterRouter(c.address, "pwm", Seq("sifive,pwm0"), interrupts = c.ncmp, size = c.size, beatBytes = w)(
+  new TLRegBundle(c, _)    with HasPWMBundleContents)(
+  new TLRegModule(c, _, _) with HasPWMModuleContents)
+  with HasCrossing{
+  val crossing = c.crossingType
 }

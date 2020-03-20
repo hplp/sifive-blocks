@@ -2,7 +2,6 @@
 package sifive.blocks.devices.spi
 
 import Chisel._
-import chisel3.experimental._ 
 import freechips.rocketchip.config.Parameters
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.regmapper._
@@ -22,9 +21,8 @@ trait SPIParamsBase {
   val frameBits: Int
   val delayBits: Int
   val divisorBits: Int
-  val fineDelayBits: Int
-  val sampleDelayBits: Int
-  val defaultSampleDel:Int
+
+  val sampleDelay: Int
 
   lazy val csIdBits = log2Up(csWidth)
   lazy val lengthBits = log2Floor(frameBits) + 1
@@ -44,38 +42,39 @@ case class SPIParams(
     frameBits: Int = 8,
     delayBits: Int = 8,
     divisorBits: Int = 12,
-    fineDelayBits: Int = 0,
-    sampleDelayBits: Int = 5,
-    defaultSampleDel: Int = 3
+    sampleDelay: Int = 2,
+    crossingType: SubsystemClockCrossing = SynchronousCrossing()
     )
   extends SPIParamsBase {
 
   require(frameBits >= 4)
-  require((fineDelayBits == 0) | (fineDelayBits == 5), s"Require fine delay bits to be 0 or 5 and not $fineDelayBits")
-  require(sampleDelayBits >= 0)
-  require(defaultSampleDel >= 0)
+  require(sampleDelay >= 0)
 }
 
 class SPITopModule(c: SPIParamsBase, outer: TLSPIBase)
-    extends LazyModuleImp(outer) {
+  extends LazyModuleImp(outer) {
+
+  val io = IO(new Bundle {
+    val port = new SPIPortIO(c)
+  })
 
   val ctrl = Reg(init = SPIControl.init(c))
+
   val fifo = Module(new SPIFIFO(c))
   val mac = Module(new SPIMedia(c))
+  io.port <> mac.io.port
 
-  outer.port <> mac.io.port
   fifo.io.ctrl.fmt := ctrl.fmt
   fifo.io.ctrl.cs <> ctrl.cs
   fifo.io.ctrl.wm := ctrl.wm
   mac.io.ctrl.sck := ctrl.sck
-  mac.io.ctrl.extradel := ctrl.extradel
-  mac.io.ctrl.sampledel := ctrl.sampledel
   mac.io.ctrl.dla := ctrl.dla
   mac.io.ctrl.cs <> ctrl.cs
 
   val ie = Reg(init = new SPIInterrupts().fromBits(Bits(0)))
   val ip = fifo.io.ip
-  outer.interrupts(0) := (ip.txwm && ie.txwm) || (ip.rxwm && ie.rxwm)
+  val (io_int, _) = outer.intnode.out(0)
+  io_int(0) := (ip.txwm && ie.txwm) || (ip.rxwm && ie.rxwm)
 
   protected val regmapBase = Seq(
     SPICRs.sckdiv -> Seq(RegField(c.divisorBits, ctrl.sck.div,
@@ -128,17 +127,7 @@ class SPITopModule(c: SPIParamsBase, outer: TLSPIBase)
       RegField.r(1, ip.txwm,
       RegFieldDesc("txwm_ip","Transmit watermark interupt pending", volatile=true)),
       RegField.r(1, ip.rxwm,
-      RegFieldDesc("rxwm_ip","Receive watermark interupt pending", volatile=true)))),
-
-    SPICRs.extradel -> RegFieldGroup("extradel",Some("delay from the sck edge"),Seq(
-      RegField(c.divisorBits, ctrl.extradel.coarse,
-      RegFieldDesc("extradel_coarse","Coarse grain sample delay", reset=Some(0))),
-      RegField(c.fineDelayBits, ctrl.extradel.fine,
-      RegFieldDesc("extradel_fine","Fine grain sample delay", reset=Some(0))))),
-
-    SPICRs.sampledel -> RegFieldGroup("sampledel",Some("Number of delay stages from slave to SPI controller"),Seq(
-      RegField(c.sampleDelayBits, ctrl.sampledel.sd,
-      RegFieldDesc("sampledel_sd","Number of delay stages from slave to the SPI controller", reset=Some(c.defaultSampleDel))))))
+      RegFieldDesc("rxwm_ip","Receive watermark interupt pending", volatile=true)))))
 }
 
 class MMCDevice(spi: Device, maxMHz: Double = 20) extends SimpleDevice("mmc", Seq("mmc-spi-slot")) {
@@ -167,26 +156,27 @@ class FlashDevice(spi: Device, bits: Int = 4, maxMHz: Double = 50, compat: Seq[S
   }
 }
 
-abstract class TLSPIBase(w: Int, c: SPIParamsBase)(implicit p: Parameters) extends IORegisterRouter(
-      RegisterRouterParams(
-        name = "spi",
-        compat = Seq("sifive,spi0"),
-        base = c.rAddress,
-        size = c.rSize,
-        beatBytes = w),
-      new SPIPortIO(c))
-    with HasInterruptSources {
+abstract class TLSPIBase(w: Int, c: SPIParamsBase)(implicit p: Parameters) extends LazyModule {
   require(isPow2(c.rSize))
-  override def extraResources(resources: ResourceBindings) = Map(
+  val device = new SimpleDevice("spi", Seq("sifive,spi0")) {
+    override def describe(resources: ResourceBindings): Description = {
+      val Description(name, mapping) = super.describe(resources)
+      val extra = Map(
         "#address-cells" -> Seq(ResourceInt(1)),
         "#size-cells" -> Seq(ResourceInt(0)))
-  override def nInterrupts = 1
+      Description(name, mapping ++ extra)
+    }
+  }
+  val rnode = TLRegisterNode(address = Seq(AddressSet(c.rAddress, c.rSize-1)), device = device, beatBytes = w)
+  val intnode = IntSourceNode(IntSourcePortSimple(resources = device.int))
 }
 
 class TLSPI(w: Int, c: SPIParams)(implicit p: Parameters)
-    extends TLSPIBase(w,c)(p) with HasTLControlRegMap {
+  extends TLSPIBase(w,c)(p)
+  with HasCrossing{
+  val crossing = c.crossingType
   lazy val module = new SPITopModule(c, this) {
     mac.io.link <> fifo.io.link
-    regmap(regmapBase:_*)
+    rnode.regmap(regmapBase:_*)
   }
 }

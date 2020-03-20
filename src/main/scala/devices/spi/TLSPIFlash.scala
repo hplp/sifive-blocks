@@ -12,6 +12,7 @@ import freechips.rocketchip.util.HeterogeneousBag
 trait SPIFlashParamsBase extends SPIParamsBase {
   val fAddress: BigInt
   val fSize: BigInt
+  val fBufferDepth: Int
 
   val insnAddrBytes: Int
   val insnPadLenBits: Int
@@ -23,6 +24,7 @@ trait SPIFlashParamsBase extends SPIParamsBase {
 case class SPIFlashParams(
     rAddress: BigInt,
     fAddress: BigInt,
+    fBufferDepth: Int = 0,
     rSize: BigInt = 0x1000,
     fSize: BigInt = 0x20000000,
     rxDepth: Int = 8,
@@ -30,19 +32,15 @@ case class SPIFlashParams(
     csWidth: Int = 1,
     delayBits: Int = 8,
     divisorBits: Int = 12,
-    fineDelayBits: Int = 0,
-    sampleDelayBits: Int = 5,
-    defaultSampleDel: Int = 3
-    )
+    sampleDelay: Int = 2,
+    crossingType: SubsystemClockCrossing = SynchronousCrossing())
   extends SPIFlashParamsBase {
   val frameBits = 8
   val insnAddrBytes = 4
   val insnPadLenBits = 4
 
   require(insnPadLenBits <= delayBits)
-  require((fineDelayBits == 0) | (fineDelayBits == 5), s"Require fine delay bits to be 0 or 5 and not $fineDelayBits")
-  require(sampleDelayBits >= 0)
-  require(defaultSampleDel >= 0)
+  require(sampleDelay >= 0)
 }
 
 class SPIFlashTopModule(c: SPIFlashParamsBase, outer: TLSPIFlashBase)
@@ -115,18 +113,17 @@ abstract class TLSPIFlashBase(w: Int, c: SPIFlashParamsBase)(implicit p: Paramet
       supportsGet = TransferSizes(1, 1),
       fifoId      = Some(0))),
     beatBytes = 1)))
-  val memXing = this.crossIn(fnode)
 }
 
-class TLSPIFlash(w: Int, c: SPIFlashParams)(implicit p: Parameters)
-    extends TLSPIFlashBase(w,c)(p)
-    with HasTLControlRegMap {
+class TLSPIFlash(w: Int, c: SPIFlashParams)(implicit p: Parameters) extends TLSPIFlashBase(w,c)(p) with HasCrossing {
+  val crossing = c.crossingType
+
   lazy val module = new SPIFlashTopModule(c, this) {
 
     arb.io.inner(0) <> flash.io.link
     arb.io.inner(1) <> fifo.io.link
     mac.io.link <> arb.io.outer
 
-    regmap(regmapBase ++ regmapFlash:_*)
+    rnode.regmap(regmapBase ++ regmapFlash:_*)
   }
 }

@@ -2,10 +2,11 @@
 package sifive.blocks.devices.chiplink
 
 import Chisel._
+import chisel3.experimental.withClock
 import freechips.rocketchip.config.{Field, Parameters}
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.tilelink._
-import freechips.rocketchip.devices.tilelink._
+import freechips.rocketchip.devices.tilelink.TLBusBypass
 import freechips.rocketchip.util._
 
 class ChipLink(val params: ChipLinkParams)(implicit p: Parameters) extends LazyModule() {
@@ -61,22 +62,10 @@ class ChipLink(val params: ChipLinkParams)(implicit p: Parameters) extends LazyM
         supportsProbe = if (i == 0) params.fullXfer else params.noXfer) },
     minLatency = params.latency)))
 
-  private val sbypass = LazyModule(new TLBusBypass(beatBytes = 4))
-  slaveNode := sbypass.node
+  private val bypass = LazyModule(new TLBusBypass(beatBytes = 4))
+  slaveNode := bypass.node
 
-  private val mute = LazyModule(new MuteMaster(maxProbe = params.acqXfer.max))
-  private val mbypass = LazyModule(new MasterMux(_.last))
-  private val buffer = LazyModule(new TLBuffer(
-    a = BufferParams.none,
-    b = BufferParams.none,
-    c = BufferParams.default,
-    d = BufferParams.none,
-    e = BufferParams.none))
-  mbypass.node := buffer.node := mute.node
-  mbypass.node := masterNode
-
-  val node = NodeHandle(sbypass.node, mbypass.node)
-  val ioNode = BundleBridgeSource(() => new WideDataLayerPort(params).cloneType)
+  val node = NodeHandle(bypass.node, masterNode)
 
   // Exported memory map. Used when connecting VIP
   lazy val managers = masterNode.edges.out(0).manager.managers
@@ -89,14 +78,12 @@ class ChipLink(val params: ChipLinkParams)(implicit p: Parameters) extends LazyM
 
   lazy val module = new LazyModuleImp(this) {
     val io = IO(new Bundle {
+      val port = new WideDataLayerPort(params)
       val bypass = Bool(OUTPUT)
       // When not syncTX, these drive the TX domain
       val c2b_clk = Clock(INPUT)
       val c2b_rst = Bool(INPUT)
-      // If fpgaReset, we need a pulse that arrives before b2c_clk locks
-      val fpga_reset = if (params.fpgaReset) Some(Bool(INPUT)) else None
     })
-    val port = ioNode.bundle
 
     // Ensure downstream devices support our requirements
     val (in,  edgeIn)  = slaveNode.in(0)
@@ -130,8 +117,8 @@ class ChipLink(val params: ChipLinkParams)(implicit p: Parameters) extends LazyM
 
     // Anything that is optional, must be supported by the error device (for redirect)
     val errorDevs = edgeOut.manager.managers.filter(_.nodePath.last.lazyModule.className == "TLError")
-    require (errorDevs.exists(_.supportsAcquireB), "There is no TLError with Acquire reachable from ChipLink. One must be instantiated.")
-    val errorDev = errorDevs.find(_.supportsAcquireB).get
+    require (!errorDevs.isEmpty, "There is no TLError reachable from ChipLink. One must be instantiated.")
+    val errorDev = errorDevs.head
     require (errorDev.supportsPutFull.contains(params.fullXfer),
       s"ChipLink requires ${errorDev.name} support ${params.fullXfer} PutFill, not ${errorDev.supportsPutFull}")
     require (errorDev.supportsPutPartial.contains(params.fullXfer),
@@ -148,7 +135,7 @@ class ChipLink(val params: ChipLinkParams)(implicit p: Parameters) extends LazyM
       s"ChipLink supports at most one caching master, ${edgeIn.client.clients.filter(_.supportsProbe).map(_.name)}")
 
     // Construct the info needed by all submodules
-    val info = ChipLinkInfo(params, edgeIn, edgeOut, errorDev.address.head)
+    val info = ChipLinkInfo(params, edgeIn, edgeOut, errorDevs.head.address.head.base)
 
     val sinkA = Module(new SinkA(info))
     val sinkB = Module(new SinkB(info))
@@ -162,23 +149,11 @@ class ChipLink(val params: ChipLinkParams)(implicit p: Parameters) extends LazyM
     val sourceE = Module(new SourceE(info))
 
     val rx = Module(new RX(info))
-    rx.clock := port.b2c.clk
-
-    // The off-chip reset is registered internally to improve timing
-    // The RX module buffers incoming data by one cycle to compensate the reset delay
-    // It is required that the internal reset be high even when the b2c.clk does not run
-    io.fpga_reset match {
-      case None =>
-        // b2c.rst is actually synchronous to b2c.clk, so one flop is enough
-        rx.reset := AsyncResetReg(Bool(false), port.b2c.clk, port.b2c.rst, true, None)
-      case Some(resetPulse) =>
-        // For high performance, FPGA IO buffer registers must feed IO into D, not reset
-        // However, FPGA registers also support an initial block to generate a reset pulse
-        rx.reset := AsyncResetReg(port.b2c.rst, port.b2c.clk, resetPulse, true, None)
-    }
-
-    rx.io.b2c_data := port.b2c.data
-    rx.io.b2c_send := port.b2c.send
+    rx.clock := io.port.b2c.clk
+    rx.reset := AsyncResetReg(io.port.b2c.rst, io.port.b2c.clk, reset, true, None)
+    // ^^^ Clock recovery is safe, because b2c.rst is high longer than reset
+    rx.io.b2c_data := io.port.b2c.data
+    rx.io.b2c_send := io.port.b2c.send
     out.a <> sourceA.io.a
     in .b <> sourceB.io.b
     out.c <> sourceC.io.c
@@ -191,10 +166,10 @@ class ChipLink(val params: ChipLinkParams)(implicit p: Parameters) extends LazyM
     sourceE.io.q <> FromAsyncBundle(rx.io.e)
 
     val tx = Module(new TX(info))
-    port.c2b.clk := tx.io.c2b_clk
-    port.c2b.rst := tx.io.c2b_rst
-    port.c2b.data := tx.io.c2b_data
-    port.c2b.send := tx.io.c2b_send
+    io.port.c2b.clk := tx.io.c2b_clk
+    io.port.c2b.rst := tx.io.c2b_rst
+    io.port.c2b.data := tx.io.c2b_data
+    io.port.c2b.send := tx.io.c2b_send
     sinkA.io.a <> in .a
     sinkB.io.b <> out.b
     sinkC.io.c <> in .c
@@ -210,11 +185,11 @@ class ChipLink(val params: ChipLinkParams)(implicit p: Parameters) extends LazyM
       // Create the TX clock domain from input
       tx.clock := io.c2b_clk
       tx.reset := io.c2b_rst
-      tx.io.a <> ToAsyncBundle(sinkA.io.q, params.crossing)
-      tx.io.b <> ToAsyncBundle(sinkB.io.q, params.crossing)
-      tx.io.c <> ToAsyncBundle(sinkC.io.q, params.crossing)
-      tx.io.d <> ToAsyncBundle(sinkD.io.q, params.crossing)
-      tx.io.e <> ToAsyncBundle(sinkE.io.q, params.crossing)
+      tx.io.a <> ToAsyncBundle(sinkA.io.q, params.crossingDepth)
+      tx.io.b <> ToAsyncBundle(sinkB.io.q, params.crossingDepth)
+      tx.io.c <> ToAsyncBundle(sinkC.io.q, params.crossingDepth)
+      tx.io.d <> ToAsyncBundle(sinkD.io.q, params.crossingDepth)
+      tx.io.e <> ToAsyncBundle(sinkE.io.q, params.crossingDepth)
     }
 
     // Pass credits from RX to TX
@@ -231,8 +206,7 @@ class ChipLink(val params: ChipLinkParams)(implicit p: Parameters) extends LazyM
 
     // Disable ChipLink while RX+TX are in reset
     val do_bypass = ResetCatchAndSync(clock, rx.reset) || ResetCatchAndSync(clock, tx.reset)
-    sbypass.module.io.bypass := do_bypass
-    mbypass.module.io.bypass := do_bypass
+    bypass.module.io.bypass := do_bypass
     io.bypass := do_bypass
   }
 }
